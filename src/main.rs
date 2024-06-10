@@ -1,0 +1,436 @@
+//Comments are left from Dumbpipe
+//! Command line arguments.
+mod utils;
+
+use anyhow::Context;
+use clap::{Parser, Subcommand};
+use dumbpipe::NodeTicket;
+use iroh_net::{
+    endpoint::{get_remote_node_id, Connecting},
+    key::SecretKey,
+    Endpoint, NodeAddr,
+};
+use std::{
+    io,
+    net::{SocketAddr, ToSocketAddrs},
+    str::FromStr,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    select,
+};
+use tokio_util::sync::CancellationToken;
+use utils::{cancel_token,copy_from_quinn, copy_to_quinn};
+use crate::utils::get_or_create_secret;
+
+#[derive(Parser, Debug)]
+pub struct Args {
+    #[clap(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Commands {
+    Listen(ListenArgs),
+
+    Forward(ListenTcpArgs),
+
+    Connect(ConnectArgs),
+
+    ConnectTcp(ConnectTcpArgs),
+
+    Relay(RelayArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct CommonArgs {
+    /// The port to use for the magicsocket. Random by default.
+    #[clap(long, default_value_t = 0)]
+    pub magic_port: u16,
+
+    /// A custom ALPN to use for the magicsocket.
+    ///
+    /// This is an expert feature that allows dumbpipe to be used to interact
+    /// with existing iroh protocols.
+    ///
+    /// When using this option, the connect side must also specify the same ALPN.
+    /// The listen side will not expect a handshake, and the connect side will
+    /// not send one.
+    ///
+    /// Alpns are byte strings. To specify an utf8 string, prefix it with `utf8:`.
+    /// Otherwise, it will be parsed as a hex string.
+    #[clap(long)]
+    pub custom_alpn: Option<String>,
+
+    #[clap(short = 'v', long, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+}
+
+impl CommonArgs {
+    fn alpn(&self) -> anyhow::Result<Vec<u8>> {
+        Ok(match &self.custom_alpn {
+            Some(alpn) => parse_alpn(alpn)?,
+            None => dumbpipe::ALPN.to_vec(),
+        })
+    }
+
+    fn is_custom_alpn(&self) -> bool {
+        self.custom_alpn.is_some()
+    }
+}
+
+fn parse_alpn(alpn: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(if let Some(text) = alpn.strip_prefix("utf8:") {
+        text.as_bytes().to_vec()
+    } else {
+        hex::decode(alpn)?
+    })
+}
+
+#[derive(Parser, Debug)]
+pub struct RelayArgs {
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListenArgs {
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ListenTcpArgs {
+    #[clap(long)]
+    pub host: String,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ConnectTcpArgs {
+    /// The addresses to listen on for incoming tcp connections.
+    ///
+    /// To listen on all network interfaces, use 0.0.0.0:12345
+    #[clap(long)]
+    pub addr: String,
+
+    /// The node to connect to
+    pub ticket: NodeTicket,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+#[derive(Parser, Debug)]
+pub struct ConnectArgs {
+    /// The node to connect to
+    pub ticket: NodeTicket,
+
+    #[clap(flatten)]
+    pub common: CommonArgs,
+}
+
+
+/// Bidirectionally forward data from a quinn stream and an arbitrary tokio
+/// reader/writer pair, aborting both sides when either one forwarder is done,
+/// or when control-c is pressed.
+async fn forward_bidi(
+    from1: impl AsyncRead + Send + Sync + Unpin + 'static,
+    to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
+    from2: iroh_quinn::RecvStream,
+    to2: iroh_quinn::SendStream,
+) -> anyhow::Result<()> {
+    let token1 = CancellationToken::new();
+    let token2 = token1.clone();
+    let token3 = token1.clone();
+    let forward_from_stdin = tokio::spawn(async move {
+        copy_to_quinn(from1, to2, token1.clone())
+            .await
+            .map_err(cancel_token(token1))
+    });
+    let forward_to_stdout = tokio::spawn(async move {
+        copy_from_quinn(from2, to1, token2.clone())
+            .await
+            .map_err(cancel_token(token2))
+    });
+    let _control_c = tokio::spawn(async move {
+        tokio::signal::ctrl_c().await?;
+        token3.cancel();
+        io::Result::Ok(())
+    });
+    forward_to_stdout.await??;
+    forward_from_stdin.await??;
+    Ok(())
+}
+
+async fn listen_stdio(args: ListenArgs) -> anyhow::Result<()> {
+    let secret_key = get_or_create_secret()?;
+    let endpoint = Endpoint::builder()
+        .alpns(vec![args.common.alpn()?])
+        .secret_key(secret_key)
+        .bind(args.common.magic_port)
+        .await?;
+    // wait for the endpoint to figure out its address before making a ticket
+    while endpoint.my_relay().is_none() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let node = endpoint.my_addr().await?;
+    let mut short = node.clone();
+    
+    println!("[+] Listening on: ");
+    for ip in node.info.direct_addresses.iter() {
+        println!("{:?}", ip);
+    }
+    let ticket = NodeTicket::new(node)?;
+    short.info.direct_addresses.clear();
+    let short = NodeTicket::new(short)?;
+
+    // print the ticket on stderr so it doesn't interfere with the data itself
+    //
+    // note that the tests rely on the ticket being the last thing printed
+    eprintln!("To connect, use:\n\n./oxide connect {}", ticket);
+    eprintln!("\nor:\n\noxide connect {}", short);
+    //eprintln!("ticket: {:?}", ticket.node_addr());
+
+    loop {
+        let Some(connecting) = endpoint.accept().await else {
+            break;
+        };
+        let connection = match connecting.await {
+            Ok(connection) => connection,
+            Err(cause) => {
+                tracing::warn!("error accepting connection: {}", cause);
+                // if accept fails, we want to continue accepting connections
+                continue;
+            }
+        };
+        let remote_node_id = get_remote_node_id(&connection)?;
+        tracing::info!("got connection from {}", remote_node_id);
+        let (s, mut r) = match connection.accept_bi().await {
+            Ok(x) => x,
+            Err(cause) => {
+                tracing::warn!("error accepting stream: {}", cause);
+                // if accept_bi fails, we want to continue accepting connections
+                continue;
+            }
+        };
+        tracing::info!("accepted bidi stream from {}", remote_node_id);
+        if !args.common.is_custom_alpn() {
+            // read the handshake and verify it
+            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
+            r.read_exact(&mut buf).await?;
+            anyhow::ensure!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+        }
+        tracing::info!("forwarding stdin/stdout to {}", remote_node_id);
+        forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
+        // stop accepting connections after the first successful one
+    }
+    Ok(())
+}
+
+async fn connect_stdio(args: ConnectArgs) -> anyhow::Result<()> {
+    let secret_key = get_or_create_secret()?;
+    let endpoint = Endpoint::builder()
+        .secret_key(secret_key)
+        .alpns(vec![])
+        .bind(args.common.magic_port)
+        .await?;
+    let addr = args.ticket.node_addr();
+    let remote_node_id = addr.node_id;
+    // connect to the node, try only once
+    let connection = endpoint.connect(addr.clone(), &args.common.alpn()?).await?;
+    tracing::info!("connected to {}", remote_node_id);
+    // open a bidi stream, try only once
+    let (mut s, r) = connection.open_bi().await?;
+    tracing::info!("opened bidi stream to {}", remote_node_id);
+    // send the handshake unless we are using a custom alpn
+    // when using a custom alpn, evertyhing is up to the user
+    if !args.common.is_custom_alpn() {
+        // the connecting side must write first. we don't know if there will be something
+        // on stdin, so just write a handshake.
+        s.write_all(&dumbpipe::HANDSHAKE).await?;
+    }
+    tracing::info!("forwarding stdin/stdout to {}", remote_node_id);
+    forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
+    tokio::io::stdout().flush().await?;
+    Ok(())
+}
+
+/// Listen on a tcp port and forward incoming connections to a magicsocket.
+async fn connect_tcp(args: ConnectTcpArgs) -> anyhow::Result<()> {
+    let addrs = args
+        .addr
+        .to_socket_addrs()
+        .context(format!("invalid host string {}", args.addr))?;
+    let secret_key = get_or_create_secret()?;
+    let endpoint = Endpoint::builder()
+        .alpns(vec![])
+        .secret_key(secret_key)
+        .bind(args.common.magic_port)
+        .await
+        .context("unable to bind magicsock")?;
+    tracing::info!("tcp listening on {:?}", addrs);
+    let tcp_listener = match tokio::net::TcpListener::bind(addrs.as_slice()).await {
+        Ok(tcp_listener) => tcp_listener,
+        Err(cause) => {
+            tracing::error!("error binding tcp socket to {:?}: {}", addrs, cause);
+            return Ok(());
+        }
+    };
+    eprintln!("\n[+]Forwarding incoming requests to '{}'.\n", args.addr);
+    async fn handle_tcp_accept(
+        next: io::Result<(tokio::net::TcpStream, SocketAddr)>,
+        addr: NodeAddr,
+        endpoint: Endpoint,
+        handshake: bool,
+        alpn: &[u8],
+    ) -> anyhow::Result<()> {
+        let (tcp_stream, tcp_addr) = next.context("error accepting tcp connection")?;
+        let (tcp_recv, tcp_send) = tcp_stream.into_split();
+        tracing::info!("got tcp connection from {}", tcp_addr);
+        let remote_node_id = addr.node_id;
+        let connection = endpoint
+            .connect(addr, alpn)
+            .await
+            .context(format!("error connecting to {}", remote_node_id))?;
+        let (mut magic_send, magic_recv) = connection
+            .open_bi()
+            .await
+            .context(format!("error opening bidi stream to {}", remote_node_id))?;
+        // send the handshake unless we are using a custom alpn
+        // when using a custom alpn, evertyhing is up to the user
+        if handshake {
+            // the connecting side must write first. we don't know if there will be something
+            // on stdin, so just write a handshake.
+            magic_send.write_all(&dumbpipe::HANDSHAKE).await?;
+        }
+        forward_bidi(tcp_recv, tcp_send, magic_recv, magic_send).await?;
+        anyhow::Ok(())
+    }
+    let addr = args.ticket.node_addr();
+    loop {
+        // also wait for ctrl-c here so we can use it before accepting a connection
+        let next = tokio::select! {
+            stream = tcp_listener.accept() => stream,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("got ctrl-c, exiting");
+                break;
+            }
+        };
+        let endpoint = endpoint.clone();
+        let addr = addr.clone();
+        let handshake = !args.common.is_custom_alpn();
+        let alpn = args.common.alpn()?;
+        tokio::spawn(async move {
+            if let Err(cause) = handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await {
+                // log error at warn level
+                //
+                // we should know about it, but it's not fatal
+                tracing::warn!("error handling connection: {}", cause);
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Listen on a magicsocket and forward incoming connections to a tcp socket.
+async fn listen_tcp(args: ListenTcpArgs) -> anyhow::Result<()> {
+    let addrs = match args.host.to_socket_addrs() {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(e) => anyhow::bail!("invalid host string {}: {}", args.host, e),
+    };
+    let secret_key = get_or_create_secret()?;
+    let endpoint = Endpoint::builder()
+        .alpns(vec![args.common.alpn()?])
+        .secret_key(secret_key)
+        .bind(args.common.magic_port)
+        .await?;
+    // wait for the endpoint to figure out its address before making a ticket
+    while endpoint.my_relay().is_none() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let node_addr = endpoint.my_addr().await?;
+    let mut short = node_addr.clone();
+    let ticket = NodeTicket::new(node_addr)?;
+    short.info.direct_addresses.clear();
+    let short = NodeTicket::new(short)?;
+
+
+    eprintln!("Forwarding incoming requests to '{}'.\n", args.host);
+
+    eprintln!("oxide connect-tcp --addr localhost:3000 {ticket}");
+
+    // handle a new incoming connection on the magic endpoint
+    async fn handle_magic_accept(
+        connecting: Connecting,
+        addrs: Vec<std::net::SocketAddr>,
+        handshake: bool,
+    ) -> anyhow::Result<()> {
+        let connection = connecting.await.context("error accepting connection")?;
+        let remote_node_id = get_remote_node_id(&connection)?;
+        tracing::info!("got connection from {}", remote_node_id);
+        let (s, mut r) = connection
+            .accept_bi()
+            .await
+            .context("error accepting stream")?;
+        tracing::info!("accepted bidi stream from {}", remote_node_id);
+        if handshake {
+            // read the handshake and verify it
+            let mut buf = [0u8; dumbpipe::HANDSHAKE.len()];
+            r.read_exact(&mut buf).await?;
+            anyhow::ensure!(buf == dumbpipe::HANDSHAKE, "invalid handshake");
+        }
+        let connection = tokio::net::TcpStream::connect(addrs.as_slice())
+            .await
+            .context(format!("error connecting to {:?}", addrs))?;
+        let (read, write) = connection.into_split();
+        forward_bidi(read, write, r, s).await?;
+        Ok(())
+    }
+
+    loop {
+        let connecting = select! {
+            connecting = endpoint.accept() => connecting,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("got ctrl-c, exiting");
+                break;
+            }
+        };
+        let Some(connecting) = connecting else {
+            break;
+        };
+        let addrs = addrs.clone();
+        let handshake = !args.common.is_custom_alpn();
+        tokio::spawn(async move {
+            if let Err(cause) = handle_magic_accept(connecting, addrs, handshake).await {
+                // log error at warn level
+                //
+                // we should know about it, but it's not fatal
+                tracing::warn!("error handling connection: {}", cause);
+            }
+        });
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+    let res = match args.command {
+        Commands::Listen(args) => listen_stdio(args).await,
+        Commands::Forward(args) => listen_tcp(args).await,
+        Commands::Connect(args) => connect_stdio(args).await,
+        Commands::ConnectTcp(args) => connect_tcp(args).await,
+        Commands::Relay(args) => todo!(),
+    };
+    match res {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1)
+        }
+    }
+}
